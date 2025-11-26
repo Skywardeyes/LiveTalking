@@ -1,92 +1,54 @@
-import os
 import time
-from urllib.parse import urljoin
-
+import os
 from basereal import BaseReal
 from logger import logger
 
-try:
-    from openai import OpenAI  # type: ignore
-except ImportError:  # pragma: no cover
-    OpenAI = None
-
-
-def _build_anythingllm_client():
-    """
-    通过 OpenAI 兼容接口连接 AnythingLLM。
-    需要配置:
-        ANYTHINGLLM_BASE_URL -> 例如 http://localhost:3001/api
-        ANYTHINGLLM_API_KEY  -> 控制台生成的 key
-        ANYTHINGLLM_MODEL    -> workspace slug
-    """
-    if OpenAI is None:
-        raise RuntimeError("openai package not installed")
-
-    base_url = os.getenv("ANYTHINGLLM_BASE_URL", "http://localhost:3001/api")
-    api_key = os.getenv("ANYTHINGLLM_API_KEY")
-    model = os.getenv("ANYTHINGLLM_MODEL", "3c22d8a4-f57b-41c1-985f-fe13860e3a51")
-
-    if not api_key:
-        raise RuntimeError("ANYTHINGLLM_API_KEY not set")
-
-    normalized_base = base_url.rstrip("/") + "/"
-    openai_base = urljoin(normalized_base, "v1/openai")
-
-    client = OpenAI(api_key=api_key, base_url=openai_base)
-    return client, model
-
-
 def llm_response(message, nerfreal: BaseReal):
     start = time.perf_counter()
-
-    try:
-        client, model = _build_anythingllm_client()
-    except Exception:
-        logger.exception("init anythingllm client failed")
-        nerfreal.put_msg_txt("抱歉，大模型服务暂时不可用。")
-        return
-
+    
+    # === 连接本地 Ollama 的 OpenAI 兼容接口 ===
+    from openai import OpenAI
+    client = OpenAI(
+        base_url="http://localhost:11434/v1",  # Ollama 的 OpenAI API 地址
+        api_key="ollama"  # Ollama 不需要真实 key，但 SDK 要求填写，任意字符串即可
+    )
     end = time.perf_counter()
-    logger.info("llm Time init: %ss", end - start)
+    logger.info(f"llm Time init: {end - start}s")
 
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": message},
-            ],
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-    except Exception:
-        logger.exception("anythingllm chat request failed")
-        nerfreal.put_msg_txt("抱歉，大模型服务暂时不可用。")
-        return
+    completion = client.chat.completions.create(
+        model="qwen3:latest",  # 必须与你本地 pull 的模型名一致
+        messages=[
+            {'role': 'system', 'content': '你是智能助手，请根据用户的问题给出回答，回答不要超过一百字，不要带任何标点符号，不要使用任何表情符号，不要使用中文以外的任何语言'},
+            {'role': 'user', 'content': message}
+        ],
+        stream=True,
+        # 注意：Ollama 不支持 stream_options.include_usage，必须移除
+    )
 
     result = ""
     first = True
     for chunk in completion:
-        if len(chunk.choices) == 0:
-            continue
+        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content is not None:
+            msg = chunk.choices[0].delta.content
+            if first:
+                end = time.perf_counter()
+                logger.info(f"llm Time to first chunk: {end - start}s")
+                first = False
 
-        if first:
-            end = time.perf_counter()
-            logger.info("llm Time to first chunk: %ss", end - start)
-            first = False
+            lastpos = 0
+            for i, char in enumerate(msg):
+                if char in ",.!;:，。！？：；":
+                    segment = result + msg[lastpos:i+1]
+                    lastpos = i + 1
+                    if len(segment) > 10:
+                        logger.info(segment)
+                        nerfreal.put_msg_txt(segment)
+                        result = ""
+                    else:
+                        result = segment
+            result += msg[lastpos:]
 
-        msg = chunk.choices[0].delta.content or ""
-        lastpos = 0
-        for i, char in enumerate(msg):
-            if char in ",.!;:，。！？：；":
-                result += msg[lastpos : i + 1]
-                lastpos = i + 1
-                if len(result) > 10:
-                    nerfreal.put_msg_txt(result)
-                    result = ""
-        result += msg[lastpos:]
-
-    end = time.perf_counter()
-    logger.info("llm Time to last chunk: %ss", end - start)
     if result:
+        end = time.perf_counter()
+        logger.info(f"llm Time to last chunk: {end - start}s")
         nerfreal.put_msg_txt(result)
